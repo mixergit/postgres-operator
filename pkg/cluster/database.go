@@ -75,6 +75,8 @@ const (
 			TO {{.pooler_user}};
 		GRANT USAGE ON SCHEMA {{.pooler_schema}} TO {{.pooler_user}};
 	`
+
+	getCurrentDb = `SELECT current_database();`
 )
 
 func (c *Cluster) pgConnectionString(dbname string) string {
@@ -464,7 +466,6 @@ func (c *Cluster) execCreateOrAlterExtension(extName, schemaName, statement, doi
 // Creates a connection pool credentials lookup function in every database to
 // perform remote authentification.
 func (c *Cluster) installLookupFunction(poolerSchema, poolerUser string) error {
-	var stmtBytes bytes.Buffer
 	c.logger.Info("Installing lookup function")
 
 	if err := c.initDbConn(); err != nil {
@@ -486,15 +487,20 @@ func (c *Cluster) installLookupFunction(poolerSchema, poolerUser string) error {
 		return fmt.Errorf(msg, err)
 	}
 
+	// In the view of lookup function installation fragility be on
+	// the safe side, close the current connection and open a new
+	// one.
+	if err := c.closeDbConn(); err != nil {
+		c.logger.Errorf("could not close database connection: %v", err)
+	}
+
 	templater := template.Must(template.New("sql").Parse(connectionPoolerLookup))
 
 	for dbname := range currentDatabases {
+		var stmtBytes bytes.Buffer
+
 		if dbname == "template0" || dbname == "template1" {
 			continue
-		}
-
-		if err := c.initDbConnWithName(dbname); err != nil {
-			return fmt.Errorf("could not init database connection to %s", dbname)
 		}
 
 		c.logger.Infof("Install pooler lookup function into %s", dbname)
@@ -520,7 +526,43 @@ func (c *Cluster) installLookupFunction(poolerSchema, poolerUser string) error {
 			constants.PostgresConnectTimeout,
 			constants.PostgresConnectRetryTimeout,
 			func() (bool, error) {
-				if _, err := c.pgDb.Exec(stmtBytes.String()); err != nil {
+				var (
+					currentDb string
+					err       error
+					row       *sql.Row
+				)
+
+				// At this moment we are not connected to any database
+				if err = c.initDbConnWithName(dbname); err != nil {
+					msg := "could not init database connection to %s"
+					return false, fmt.Errorf(msg, dbname)
+				}
+				defer func() {
+					if err := c.closeDbConn(); err != nil {
+						msg := "could not close database connection: %v"
+						c.logger.Errorf(msg, err)
+					}
+				}()
+
+				// Apparently there could be a case when just opening a new
+				// connection reuses the old one. To prevent that we need to
+				// verify that we actually connected to a new db.
+				if row = c.pgDb.QueryRow(getCurrentDb); err != nil {
+					return false, fmt.Errorf("could not query database: %v", err)
+				}
+
+				if err = row.Scan(&currentDb); err != nil {
+					msg := "could not process a row: %v"
+					return false, fmt.Errorf(msg, err)
+				}
+
+				// In case if indeed somehow there is a mismatch, try again.
+				if currentDb != dbname {
+					msg := "Connected to a wrong db: %s"
+					return false, fmt.Errorf(msg, currentDb)
+				}
+
+				if _, err = c.pgDb.Exec(stmtBytes.String()); err != nil {
 					msg := fmt.Errorf("could not execute sql statement %s: %v",
 						stmtBytes.String(), err)
 					return false, msg
